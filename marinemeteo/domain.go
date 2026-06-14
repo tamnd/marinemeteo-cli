@@ -1,77 +1,69 @@
+// Package marinemeteo exposes the Open-Meteo Marine Wave Forecast API as a
+// kit Domain driver.
+//
+// A multi-domain host (ant) enables it with a single blank import:
+//
+//	import _ "github.com/tamnd/marinemeteo-cli/marinemeteo"
+//
+// The same Domain also builds the standalone marinemeteo binary (see cli.NewApp).
 package marinemeteo
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes marinemeteo as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/marinemeteo-cli/marinemeteo"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// marinemeteo:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone marinemeteo binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the marinemeteo driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the marinemeteo driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "marinemeteo",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "marinemeteo",
-			Short:  "A command line for marinemeteo.",
-			Long: `A command line for marinemeteo.
-
-marinemeteo reads public marinemeteo data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+			Short:  "Marine wave forecasts from Open-Meteo",
+			Long: `marinemeteo fetches hourly and daily marine wave forecasts
+from the free Open-Meteo Marine API (marine-api.open-meteo.com).
+No API key or registration required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/marinemeteo-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `marinemeteo page` and
-	// `ant get marinemeteo://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// hourly: fetch hourly marine wave forecast
+	kit.Handle(app, kit.OpMeta{
+		Name:    "hourly",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch hourly marine wave forecast for a location",
+	}, hourlyOp)
 
-	// List op: members of a page, the home of `marinemeteo links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// marinemeteo://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// daily: fetch daily marine wave forecast
+	kit.Handle(app, kit.OpMeta{
+		Name:    "daily",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch daily marine wave forecast for a location",
+	}, dailyOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +74,128 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type hourlyInput struct {
+	Lat    float64 `kit:"flag" help:"latitude in decimal degrees"`
+	Lon    float64 `kit:"flag" help:"longitude in decimal degrees"`
+	Days   int     `kit:"flag" help:"forecast days (default 3)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type dailyInput struct {
+	Lat    float64 `kit:"flag" help:"latitude in decimal degrees"`
+	Lon    float64 `kit:"flag" help:"longitude in decimal degrees"`
+	Days   int     `kit:"flag" help:"forecast days (default 7)"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func hourlyOp(ctx context.Context, in hourlyInput, emit func(HourlyWave) error) error {
+	days := in.Days
+	if days <= 0 {
+		days = 3
+	}
+	rows, err := in.Client.HourlyForecast(ctx, in.Lat, in.Lon, days)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, row := range rows {
+		if err := emit(row); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full marinemeteo.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized marinemeteo reference: %q", input)
+func dailyOp(ctx context.Context, in dailyInput, emit func(DailyWave) error) error {
+	days := in.Days
+	if days <= 0 {
+		days = 7
 	}
-	return "page", id, nil
+	rows, err := in.Client.DailyForecast(ctx, in.Lat, in.Lon, days)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, row := range rows {
+		if err := emit(row); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// --- Resolver ---
+
+// Classify turns an input into the canonical (type, id).
+// Inputs matching "lat,lon" (two floats separated by a comma) are classified as
+// "latlon"; anything else is classified as "query".
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("empty marinemeteo reference")
+	}
+	parts := strings.SplitN(input, ",", 2)
+	if len(parts) == 2 {
+		p0 := strings.TrimSpace(parts[0])
+		p1 := strings.TrimSpace(parts[1])
+		if isFloat(p0) && isFloat(p1) {
+			return "latlon", input, nil
+		}
+	}
+	return "query", input, nil
+}
+
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "latlon":
+		parts := strings.SplitN(id, ",", 2)
+		if len(parts) != 2 {
+			return "", errs.Usage("invalid latlon id %q", id)
+		}
+		lat := strings.TrimSpace(parts[0])
+		lon := strings.TrimSpace(parts[1])
+		return fmt.Sprintf("https://%s/v1/marine?latitude=%s&longitude=%s", Host, lat, lon), nil
+	case "query":
+		return fmt.Sprintf("https://%s/v1/marine?q=%s", Host, id), nil
+	default:
 		return "", errs.Usage("marinemeteo has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+func isFloat(s string) bool {
+	if s == "" {
+		return false
 	}
-	return strings.Trim(input, "/")
+	// allow leading minus, digits, and one dot
+	dot := false
+	for i, c := range s {
+		if c == '-' && i == 0 {
+			continue
+		}
+		if c == '.' {
+			if dot {
+				return false
+			}
+			dot = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind.
 func mapErr(err error) error {
 	return err
 }
